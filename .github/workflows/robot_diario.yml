@@ -1,35 +1,34 @@
-name: Robot Financiero Autónomo
+name: Robot Diario Funes
 
 on:
   schedule:
-    # Se ejecutará todos los días a las 3:30 PM hora Colombia (20:30 UTC)
-    - cron: '30 20 * * *'
-  workflow_dispatch: # Botón de ejecución manual
+    - cron: '30 20 * * *' # 3:30 PM Hora de Colombia
+  workflow_dispatch: # Permite ejecutarlo manualmente con un botón
 
 jobs:
-  auditoria-matinal:
+  auditoria_funes:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-      - name: 1. Clonar el repositorio
+      - name: Descargar código
         uses: actions/checkout@v4
 
-      - name: 2. Instalar Python 3.11
+      - name: Configurar Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
           cache: 'pip'
 
-      - name: 3. Instalar librerías
+      - name: Instalar dependencias
         run: pip install -r requirements.txt
 
-      - name: 4. Forjar Llave Maestra en la Nube (Google Cloud)
+      - name: Inyectar Credenciales GCP de forma segura
+        run: printf '%s' "$GCP_CREDENTIALS" > credenciales.json
         env:
           GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
-        run: |
-          echo "$GCP_CREDENTIALS" > credenciales.json
 
-      - name: 5. Ejecutar Pipeline Maestro (Facturas + Vales)
+      - name: Ejecutar Orquestador Maestro
         env:
           DB_HOST: ${{ secrets.DB_HOST }}
           DB_NAME: ${{ secrets.DB_NAME }}
@@ -38,4 +37,6 @@ jobs:
           DB_PORT: ${{ secrets.DB_PORT }}
           EMAIL_USER: ${{ secrets.EMAIL_USER }}
           EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          REMITENTE_ESTACION: ${{ secrets.REMITENTE_ESTACION }}
+          ID_GOOGLE_SHEET: ${{ secrets.ID_GOOGLE_SHEET }}
         run: python robot_maestro.py
