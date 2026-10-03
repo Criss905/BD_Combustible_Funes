@@ -63,7 +63,6 @@ def conectar_gmail():
 def sanitizar_ruta(ruta_base, nombre_archivo):
     base_abs = os.path.abspath(ruta_base)
     ruta_absoluta = os.path.abspath(os.path.join(base_abs, nombre_archivo))
-    # Previene ataques Zip Slip asegurando que el archivo no escape de la carpeta temporal
     if os.path.commonpath([base_abs, ruta_absoluta]) != base_abs:
         raise ValueError(f"Intento de extracción maliciosa (Zip Slip) detectado: {nombre_archivo}")
     return ruta_absoluta
@@ -71,7 +70,6 @@ def sanitizar_ruta(ruta_base, nombre_archivo):
 def extraer_placa_y_resto(texto, placas_autorizadas):
     texto_limpio = texto.upper()
     
-    # 1. Búsqueda por conocimiento de dominio (Maquinaria)
     for nombre_oficial, variantes in MAQUINARIA_ESPECIAL.items():
         for v in variantes:
             if v in texto_limpio:
@@ -80,11 +78,9 @@ def extraer_placa_y_resto(texto, placas_autorizadas):
                     resto = re.sub(r'^[\s\-:]+|[\s\-:]+$', '', resto)
                     return nombre_oficial, resto if resto else "SIN_OBSERVACION"
     
-    # 2. Búsqueda Regex estricta + Fuzzy Matching
     match = re.search(r'([A-Z]{3}[\s-]?\d{2}[A-Z0-9])', texto_limpio)
     if match:
         placa_extraida = match.group(1).replace("-", "").replace(" ", "")
-        # Umbral estricto para evitar asignaciones erróneas
         coincidencias = difflib.get_close_matches(placa_extraida, placas_autorizadas, n=1, cutoff=0.90)
         
         if coincidencias:
@@ -102,7 +98,7 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
     requiere_revision = False
     num_factura = f"SIN_NUM_{uuid.uuid4().hex[:5]}"
     fecha = None
-    cufe = None  # Preparado para soportar UNIQUE(cufe) en PostgreSQL
+    cufe = None
     placa = "SIN_PLACA"
     observacion_adicional = "SIN_OBSERVACION"
     gals = None
@@ -121,7 +117,6 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
         texto_xml = xml_interno.text.upper()
         f_root = ET.fromstring(xml_interno.text)
         
-        # Búsqueda directa en la raíz
         nodo_id = f_root.find('./cbc:ID', ns)
         if nodo_id is not None: num_factura = nodo_id.text
         else: requiere_revision = True
@@ -130,7 +125,6 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
         if nodo_cufe is not None: cufe = nodo_cufe.text
         else: requiere_revision = True
 
-        # Evitar procesamiento doble
         cursor.execute("SELECT 1 FROM fact_facturas WHERE num_factura_estacion = %s", (num_factura,))
         if cursor.fetchone(): 
             return ("SKIP", num_factura, "Duplicado", "")
@@ -138,7 +132,6 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
         tipo_doc = "Nota de Credito" if "CreditNote" in f_root.tag else "Factura"
         tipo_combustible = "GASOLINA" if "GASOLINA" in texto_xml else "DIESEL" if "DIESEL" in texto_xml else "NO_ESPECIFICADO"
         
-        # Extracción desde Notas
         for nota in f_root.findall('.//cbc:Note', ns):
             if nota.text:
                 res_placa, res_resto = extraer_placa_y_resto(nota.text, placas_autorizadas)
@@ -149,7 +142,6 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
                 else:
                     observacion_adicional = res_resto
         
-        # Extracción desde Descripción si fallan las Notas
         if placa == "SIN_PLACA":
             for desc in f_root.findall('.//cac:Item/cbc:Description', ns):
                 if desc.text:
@@ -239,14 +231,12 @@ def procesar_facturas():
                     table.add_column("Total")
 
                     for num in track(ids, description="Extrayendo y blindando transacciones..."):
-                        # Se lee el correo sin marcarlo como procesado inmediatamente (BODY.PEEK)
                         _, data = mail.fetch(num, "(BODY.PEEK[])")
                         msg = email.message_from_bytes(data[0][1])
                         message_id = msg.get('Message-ID', 'SIN_ID_CORREO')
                         procesado_con_exito = False
 
                         try:
-                            # Aislamiento Efímero en memoria temporal
                             with tempfile.TemporaryDirectory() as DIR_TEMP:
                                 for part in msg.walk():
                                     nombre_archivo = part.get_filename()
@@ -258,7 +248,6 @@ def procesar_facturas():
                                         with zipfile.ZipFile(ruta_zip, 'r') as z:
                                             limite_seguridad = 0
                                             for miembro in z.infolist():
-                                                # Barrera contra ZIP Bomb
                                                 limite_seguridad += miembro.file_size
                                                 if limite_seguridad > 20 * 1024 * 1024:
                                                     raise ValueError("Posible ZIP Bomb: Tamaño excede límite seguro.")
@@ -282,7 +271,6 @@ def procesar_facturas():
                             console.print(f"[bold red]⚠️ Error procesando el correo {message_id}: {e_correo}[/bold red]")
                             continue
                         
-                        # Marcado definitivo del correo si la transacción fue exitosa
                         if procesado_con_exito:
                             mail.store(num, '+FLAGS', '\\Seen')
 
