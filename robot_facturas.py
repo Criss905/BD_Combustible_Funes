@@ -33,11 +33,12 @@ DB_CONFIG = {
 
 EMAIL_USER = os.getenv('EMAIL_USER')
 EMAIL_PASS = os.getenv('EMAIL_PASS')
-# Es vital definir quién te envía las facturas reales en el .env
-REMITENTE_ESTACION = os.getenv('REMITENTE_ESTACION', 'factura@transaccionesco.siigo.net')
-ASUNTO_ESTACION = os.getenv('ASUNTO_ESTACION', 'EL PLACER LTDA')
 
-# Catálogo global de alias. (En una V2, esto debería ir a una tabla dim_vehiculo_alias)
+# Limpieza estricta de variables de entorno para evitar saltos de línea y errores BAD
+REMITENTE_ESTACION = os.getenv('REMITENTE_ESTACION', 'facturacion@elplacer.com').strip()
+ASUNTO_ESTACION = os.getenv('ASUNTO_ESTACION', 'EL PLACER LTDA').strip()
+
+# Catálogo global de alias
 MAQUINARIA_ESPECIAL = {
     "EXCAVADORA LLANTAS": ["CX130", "CX 130", "LLANTAS", "CX-130", "EXCAVADORA DE LLANTAS CX130B", "RETRO DE LLANTAS CX130B"],
     "EXCAVADORA ORUGAS": ["ORUGAS", "ORUGA", "RETROEXCAVADORA", "RETRO DE ORUGAS", "EXCAVADORA DE ORUGAS"],
@@ -53,15 +54,16 @@ def conectar_gmail():
     mail.login(EMAIL_USER, EMAIL_PASS)
     mail.select("inbox")
     
-    # Seguridad Crítica: Buscar estrictamente por remitente Y asunto
-    criterio_busqueda = f'(UNSEEN FROM "{REMITENTE_ESTACION}" SUBJECT "{ASUNTO_ESTACION}")'
-    _, mensajes = mail.search(None, criterio_busqueda)
+    # Búsqueda IMAP con argumentos separados para prevenir errores de sintaxis
+    _, mensajes = mail.search(None, 'UNSEEN', 'FROM', f'"{REMITENTE_ESTACION}"', 'SUBJECT', f'"{ASUNTO_ESTACION}"')
+    
     ids = mensajes[0].split() if mensajes[0] else []
     return mail, ids
 
 def sanitizar_ruta(ruta_base, nombre_archivo):
     base_abs = os.path.abspath(ruta_base)
     ruta_absoluta = os.path.abspath(os.path.join(base_abs, nombre_archivo))
+    # Previene ataques Zip Slip asegurando que el archivo no escape de la carpeta temporal
     if os.path.commonpath([base_abs, ruta_absoluta]) != base_abs:
         raise ValueError(f"Intento de extracción maliciosa (Zip Slip) detectado: {nombre_archivo}")
     return ruta_absoluta
@@ -78,11 +80,11 @@ def extraer_placa_y_resto(texto, placas_autorizadas):
                     resto = re.sub(r'^[\s\-:]+|[\s\-:]+$', '', resto)
                     return nombre_oficial, resto if resto else "SIN_OBSERVACION"
     
-    # 2. Búsqueda Regex estricta + Fuzzy Matching (Umbral alto)
+    # 2. Búsqueda Regex estricta + Fuzzy Matching
     match = re.search(r'([A-Z]{3}[\s-]?\d{2}[A-Z0-9])', texto_limpio)
     if match:
         placa_extraida = match.group(1).replace("-", "").replace(" ", "")
-        # Umbral subido a 0.90 para evitar falsos positivos
+        # Umbral estricto para evitar asignaciones erróneas
         coincidencias = difflib.get_close_matches(placa_extraida, placas_autorizadas, n=1, cutoff=0.90)
         
         if coincidencias:
@@ -100,7 +102,7 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
     requiere_revision = False
     num_factura = f"SIN_NUM_{uuid.uuid4().hex[:5]}"
     fecha = None
-    cufe = None  # Se cambia a None para permitir UNIQUE constraints en BD
+    cufe = None  # Preparado para soportar UNIQUE(cufe) en PostgreSQL
     placa = "SIN_PLACA"
     observacion_adicional = "SIN_OBSERVACION"
     gals = None
@@ -119,25 +121,24 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
         texto_xml = xml_interno.text.upper()
         f_root = ET.fromstring(xml_interno.text)
         
-        # Corrección Semántica: Buscar en la raíz, no recursivamente
+        # Búsqueda directa en la raíz
         nodo_id = f_root.find('./cbc:ID', ns)
         if nodo_id is not None: num_factura = nodo_id.text
         else: requiere_revision = True
 
-        nodo_cufe = f_root.find('.//cbc:UUID', ns) # UUID suele ser único, pero se deja recursivo por si acaso
+        nodo_cufe = f_root.find('.//cbc:UUID', ns)
         if nodo_cufe is not None: cufe = nodo_cufe.text
         else: requiere_revision = True
 
-        # Idempotencia: Saltar si ya existe
+        # Evitar procesamiento doble
         cursor.execute("SELECT 1 FROM fact_facturas WHERE num_factura_estacion = %s", (num_factura,))
         if cursor.fetchone(): 
             return ("SKIP", num_factura, "Duplicado", "")
 
-        # Detección del tipo de documento desde la etiqueta principal
         tipo_doc = "Nota de Credito" if "CreditNote" in f_root.tag else "Factura"
         tipo_combustible = "GASOLINA" if "GASOLINA" in texto_xml else "DIESEL" if "DIESEL" in texto_xml else "NO_ESPECIFICADO"
         
-        # Disparo a Notas
+        # Extracción desde Notas
         for nota in f_root.findall('.//cbc:Note', ns):
             if nota.text:
                 res_placa, res_resto = extraer_placa_y_resto(nota.text, placas_autorizadas)
@@ -148,7 +149,7 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
                 else:
                     observacion_adicional = res_resto
         
-        # Disparo a Descripción si fallan las Notas
+        # Extracción desde Descripción si fallan las Notas
         if placa == "SIN_PLACA":
             for desc in f_root.findall('.//cac:Item/cbc:Description', ns):
                 if desc.text:
@@ -174,7 +175,6 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
         except: requiere_revision = True
             
         try:
-            # TODO: En una V2, iterar sobre cac:InvoiceLine para sumar valores y galones
             v_unit_nodo = f_root.find('.//cac:Price/cbc:PriceAmount', ns)
             v_unit = Decimal(v_unit_nodo.text) if v_unit_nodo is not None else None
         except: requiere_revision = True
@@ -219,7 +219,7 @@ def procesar_facturas():
     console.print(Panel.fit("[bold blue]🤖 ROBOT FINANCIERO CLOUD[/bold blue]", subtitle="Operación Segura e Idempotente"))
 
     if not all([os.getenv('DB_HOST'), os.getenv('EMAIL_PASS')]):
-        console.print("[bold red]❌ Error: Faltan credenciales en el archivo .env[/bold red]")
+        console.print("[bold red]❌ Error: Faltan credenciales en la configuración[/bold red]")
         sys.exit(1)
 
     try:
@@ -239,14 +239,14 @@ def procesar_facturas():
                     table.add_column("Total")
 
                     for num in track(ids, description="Extrayendo y blindando transacciones..."):
-                        # BODY.PEEK[] evita marcar el correo como leído hasta asegurar éxito
+                        # Se lee el correo sin marcarlo como procesado inmediatamente (BODY.PEEK)
                         _, data = mail.fetch(num, "(BODY.PEEK[])")
                         msg = email.message_from_bytes(data[0][1])
                         message_id = msg.get('Message-ID', 'SIN_ID_CORREO')
                         procesado_con_exito = False
 
                         try:
-                            # Aislamiento Efímero: Se crea una carpeta temporal única por correo
+                            # Aislamiento Efímero en memoria temporal
                             with tempfile.TemporaryDirectory() as DIR_TEMP:
                                 for part in msg.walk():
                                     nombre_archivo = part.get_filename()
@@ -258,7 +258,7 @@ def procesar_facturas():
                                         with zipfile.ZipFile(ruta_zip, 'r') as z:
                                             limite_seguridad = 0
                                             for miembro in z.infolist():
-                                                # Prevención ZIP Bomb (Máximo 20MB descomprimido)
+                                                # Barrera contra ZIP Bomb
                                                 limite_seguridad += miembro.file_size
                                                 if limite_seguridad > 20 * 1024 * 1024:
                                                     raise ValueError("Posible ZIP Bomb: Tamaño excede límite seguro.")
@@ -268,7 +268,6 @@ def procesar_facturas():
                                         
                                         xmls = glob.glob(os.path.join(DIR_TEMP, '*.xml'))
                                         
-                                        # Iterar sobre todos los XML del adjunto (Solución a XMLs ignorados)
                                         for xml_doc in xmls:
                                             res = procesar_xml_blindado(xml_doc, message_id, cursor, conn, placas_autorizadas)
                                             if res[0] in ["OK", "ERROR"]:
@@ -283,7 +282,7 @@ def procesar_facturas():
                             console.print(f"[bold red]⚠️ Error procesando el correo {message_id}: {e_correo}[/bold red]")
                             continue
                         
-                        # Si todo funcionó, finalmente lo marcamos como leído en Gmail
+                        # Marcado definitivo del correo si la transacción fue exitosa
                         if procesado_con_exito:
                             mail.store(num, '+FLAGS', '\\Seen')
 
