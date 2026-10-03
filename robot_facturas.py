@@ -34,7 +34,7 @@ DB_CONFIG = {
 EMAIL_USER = os.getenv('EMAIL_USER')
 EMAIL_PASS = os.getenv('EMAIL_PASS')
 # Es vital definir quién te envía las facturas reales en el .env
-REMITENTE_ESTACION = os.getenv('REMITENTE_ESTACION', 'facturacion@elplacer.com')
+REMITENTE_ESTACION = os.getenv('REMITENTE_ESTACION', 'factura@transaccionesco.siigo.net')
 ASUNTO_ESTACION = os.getenv('ASUNTO_ESTACION', 'EL PLACER LTDA')
 
 # Catálogo global de alias. (En una V2, esto debería ir a una tabla dim_vehiculo_alias)
