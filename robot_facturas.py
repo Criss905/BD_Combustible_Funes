@@ -34,7 +34,7 @@ DB_CONFIG = {
 EMAIL_USER = os.getenv('EMAIL_USER')
 EMAIL_PASS = os.getenv('EMAIL_PASS')
 
-# Limpieza estricta de variables de entorno para evitar saltos de línea y errores BAD
+# Limpieza estricta de variables de entorno para evitar saltos de línea y errores
 REMITENTE_ESTACION = os.getenv('REMITENTE_ESTACION', 'facturacion@elplacer.com').strip()
 ASUNTO_ESTACION = os.getenv('ASUNTO_ESTACION', 'EL PLACER LTDA').strip()
 
@@ -54,8 +54,9 @@ def conectar_gmail():
     mail.login(EMAIL_USER, EMAIL_PASS)
     mail.select("inbox")
     
-    # Búsqueda IMAP con argumentos separados para prevenir errores de sintaxis
-    _, mensajes = mail.search(None, 'UNSEEN', 'FROM', f'"{REMITENTE_ESTACION}"', 'SUBJECT', f'"{ASUNTO_ESTACION}"')
+    # Búsqueda ultra segura: Solicitamos únicamente los mensajes 'UNSEEN' 
+    # para prevenir por completo el error de sintaxis SEARCH command error: BAD
+    _, mensajes = mail.search(None, 'UNSEEN')
     
     ids = mensajes[0].split() if mensajes[0] else []
     return mail, ids
@@ -225,7 +226,7 @@ def procesar_facturas():
                 if not ids:
                     console.print("[yellow]📭 No hay correos nuevos para procesar en la bandeja.[/yellow]")
                 else:
-                    table = Table(title=f"Procesando {len(ids)} documentos en la nube")
+                    table = Table(title=f"Procesando documentos en la nube")
                     table.add_column("Factura", style="cyan")
                     table.add_column("Auditoría", style="bold")
                     table.add_column("Total")
@@ -233,6 +234,14 @@ def procesar_facturas():
                     for num in track(ids, description="Extrayendo y blindando transacciones..."):
                         _, data = mail.fetch(num, "(BODY.PEEK[])")
                         msg = email.message_from_bytes(data[0][1])
+                        
+                        # FILTRO DEFENSIVO EN PYTHON: Validamos remitente y asunto aquí de forma robusta
+                        remitente_correo = msg.get('From', '')
+                        asunto_correo = msg.get('Subject', '')
+                        
+                        if REMITENTE_ESTACION not in remitente_correo or ASUNTO_ESTACION not in asunto_correo:
+                            continue  # Si el correo no pertenece a la estación, se omite de forma segura
+                        
                         message_id = msg.get('Message-ID', 'SIN_ID_CORREO')
                         procesado_con_exito = False
 
