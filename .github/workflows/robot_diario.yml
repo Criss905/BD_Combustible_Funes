@@ -1,0 +1,41 @@
+name: Robot Financiero Autónomo
+
+on:
+  schedule:
+    # Se ejecutará todos los días a las 3:30 PM hora Colombia (20:30 UTC)
+    - cron: '30 20 * * *'
+  workflow_dispatch: # Botón de ejecución manual
+
+jobs:
+  auditoria-matinal:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 1. Clonar el repositorio
+        uses: actions/checkout@v4
+
+      - name: 2. Instalar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 3. Instalar librerías
+        run: pip install -r requirements.txt
+
+      - name: 4. Forjar Llave Maestra en la Nube (Google Cloud)
+        env:
+          GCP_CREDENTIALS: ${{ secrets.GCP_CREDENTIALS }}
+        run: |
+          echo "$GCP_CREDENTIALS" > credenciales.json
+
+      - name: 5. Ejecutar Pipeline Maestro (Facturas + Vales)
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASS: ${{ secrets.DB_PASS }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+        run: python robot_maestro.py
