@@ -99,6 +99,7 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
     requiere_revision = False
     num_factura = f"SIN_NUM_{uuid.uuid4().hex[:5]}"
     fecha = None
+    date_key = None
     cufe = None
     placa = "SIN_PLACA"
     observacion_adicional = "SIN_OBSERVACION"
@@ -106,6 +107,8 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
     total = None
     v_unit = None
     tipo_combustible = "NO_ESPECIFICADO"
+    id_vale = None
+    id_contrato = None
 
     try:
         tree = ET.parse(ruta_xml)
@@ -126,13 +129,15 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
         if nodo_cufe is not None: cufe = nodo_cufe.text
         else: requiere_revision = True
 
-        cursor.execute("SELECT 1 FROM fact_facturas WHERE num_factura_estacion = %s", (num_factura,))
+        # Prevenir duplicados lógicos (Idempotencia)
+        cursor.execute("SELECT 1 FROM fact_facturas WHERE cufe = %s OR num_factura_estacion = %s", (cufe, num_factura))
         if cursor.fetchone(): 
             return ("SKIP", num_factura, "Duplicado", "")
 
         tipo_doc = "Nota de Credito" if "CreditNote" in f_root.tag else "Factura"
         tipo_combustible = "GASOLINA" if "GASOLINA" in texto_xml else "DIESEL" if "DIESEL" in texto_xml else "NO_ESPECIFICADO"
         
+        # Extracción de placa a través del motor difuso
         for nota in f_root.findall('.//cbc:Note', ns):
             if nota.text:
                 res_placa, res_resto = extraer_placa_y_resto(nota.text, placas_autorizadas)
@@ -154,62 +159,84 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
                     elif observacion_adicional == "SIN_OBSERVACION":
                         observacion_adicional = res_resto
         
+        # === 1. DATA WRANGLING: Normalización de llaves foráneas ===
+        placa = placa.strip().upper()
         if placa == "SIN_PLACA":
             requiere_revision = True
 
         nodo_fecha = f_root.find('.//cbc:IssueDate', ns)
-        if nodo_fecha is not None: fecha = nodo_fecha.text
-        else: requiere_revision = True
+        if nodo_fecha is not None: 
+            fecha = nodo_fecha.text
+            # === 2. DATA WRANGLING: Creación de la Llave Temporal (date_key) ===
+            date_key = int(fecha.replace("-", ""))
+        else: 
+            requiere_revision = True
             
         try:
             total_nodo = f_root.find('.//cac:LegalMonetaryTotal/cbc:PayableAmount', ns)
-            total = Decimal(total_nodo.text) if total_nodo is not None else None
-            if total is None: requiere_revision = True
+            total = Decimal(total_nodo.text) if total_nodo is not None else Decimal('0.00')
         except: requiere_revision = True
             
         try:
             v_unit_nodo = f_root.find('.//cac:Price/cbc:PriceAmount', ns)
-            v_unit = Decimal(v_unit_nodo.text) if v_unit_nodo is not None else None
+            v_unit = Decimal(v_unit_nodo.text) if v_unit_nodo is not None else Decimal('0.00')
         except: requiere_revision = True
             
         try:
             gals_nodo = f_root.find('.//cbc:InvoicedQuantity', ns)
             if gals_nodo is None: gals_nodo = f_root.find('.//cbc:CreditedQuantity', ns)
-            gals = Decimal(gals_nodo.text) if gals_nodo is not None else None
+            gals = Decimal(gals_nodo.text) if gals_nodo is not None else Decimal('0.00')
         except: requiere_revision = True
 
         if tipo_doc == "Nota de Credito":
             if total and total > 0: total *= Decimal('-1')
             if gals and gals > 0: gals *= Decimal('-1')
 
+        # === 3. CONCILIACIÓN INTELIGENTE (1:1 Vales vs Facturas) ===
+        if placa != "SIN_PLACA" and fecha:
+            query_matching = """
+                SELECT v.id_vale, v.id_contrato
+                FROM fact_vales v
+                LEFT JOIN fact_facturas f ON v.id_vale = f.id_vale
+                WHERE v.placa = %s 
+                  AND f.id_vale IS NULL 
+                ORDER BY ABS(v.fecha_emision - %s::date) ASC
+                LIMIT 1;
+            """
+            cursor.execute(query_matching, (placa, fecha))
+            match = cursor.fetchone()
+            
+            if match:
+                id_vale = match[0]
+                id_contrato = match[1]
+            else:
+                requiere_revision = True
+                observacion_adicional = "ALERTA: Vale físico no encontrado. " + observacion_adicional
+
         id_f = str(uuid.uuid4())
         
+        # === 4. INSERCIÓN CON CUMPLIMIENTO ESTRICTO DE ESQUEMA ===
         cursor.execute("""
             INSERT INTO fact_facturas 
-            (id_factura, cufe, message_id, num_factura_estacion, fecha_factura, placa, galones_cobrados, total_cobrado, tipo_documento, valor_unitario, tipo_combustible, requiere_revision, obs_adc) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (id_f, cufe[:250] if cufe else None, message_id, num_factura, fecha, placa, gals, total, tipo_doc, v_unit, tipo_combustible, requiere_revision, observacion_adicional[:500]))
+            (id_factura, cufe, message_id, num_factura_estacion, fecha_factura, date_key, 
+             placa, galones_cobrados, total_cobrado, tipo_documento, valor_unitario, 
+             tipo_combustible, requiere_revision, obs_adc, id_vale, id_contrato) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (id_f, cufe[:250] if cufe else None, message_id, num_factura, fecha, date_key, 
+              placa, gals, total, tipo_doc, v_unit, tipo_combustible, 
+              requiere_revision, observacion_adicional[:500], id_vale, id_contrato))
         
         conn.commit()
-        estado = "⚠️ Revisión (Faltan Datos o Placa)" if requiere_revision else "✅ OK"
+        estado = "⚠️ Revisión (Sin Vale/Datos)" if requiere_revision else "✅ Conciliado"
         return ("OK", num_factura, estado, f"${total:,.2f}" if total else "N/A")
 
     except Exception as e:
         conn.rollback()
-        id_f = str(uuid.uuid4())
-        try:
-            cursor.execute("""
-                INSERT INTO fact_facturas 
-                (id_factura, message_id, num_factura_estacion, requiere_revision, obs_adc) 
-                VALUES (%s, %s, %s, TRUE, %s)
-            """, (id_f, message_id, num_factura, str(e)[:500]))
-            conn.commit()
-        except:
-            conn.rollback()
-        return ("ERROR", num_factura, "Fallo Estructural XML", str(e))
+        # === 5. DEAD-LETTER QUEUE: Eliminación del INSERT de emergencia ===
+        return ("ERROR", num_factura, "Fallo Estructural XML o Integridad", str(e))
 
 def procesar_facturas():
-    console.print(Panel.fit("[bold blue]🤖 ROBOT FINANCIERO CLOUD[/bold blue]", subtitle="Operación Segura e Idempotente"))
+    console.print(Panel.fit("[bold blue]🤖 ROBOT FINANCIERO CLOUD[/bold blue]", subtitle="Operación Segura e Idempotente con Conciliación 1:1"))
 
     if not all([os.getenv('DB_HOST'), os.getenv('EMAIL_PASS')]):
         console.print("[bold red]❌ Error: Faltan credenciales en la configuración[/bold red]")
@@ -235,12 +262,12 @@ def procesar_facturas():
                         _, data = mail.fetch(num, "(BODY.PEEK[])")
                         msg = email.message_from_bytes(data[0][1])
                         
-                        # FILTRO DEFENSIVO EN PYTHON: Validamos remitente y asunto aquí de forma robusta
+                        # FILTRO DEFENSIVO EN PYTHON: Validamos remitente y asunto
                         remitente_correo = msg.get('From', '')
                         asunto_correo = msg.get('Subject', '')
                         
                         if REMITENTE_ESTACION not in remitente_correo or ASUNTO_ESTACION not in asunto_correo:
-                            continue  # Si el correo no pertenece a la estación, se omite de forma segura
+                            continue
                         
                         message_id = msg.get('Message-ID', 'SIN_ID_CORREO')
                         procesado_con_exito = False
@@ -273,13 +300,17 @@ def procesar_facturas():
                                                 table.add_row(res[1], f"{color}{res[2]}[/]", res[3])
                                             elif res[0] == "SKIP":
                                                 table.add_row(res[1], "[bold cyan]⏭️ Omitido[/bold cyan]", "N/A")
-                                        
-                                        procesado_con_exito = True
+                                            
+                                            # Si la factura fue conciliada o requiere revisión por datos, marcamos como exitosa 
+                                            # para el buzón. Si falló la estructura, no la marcamos como vista.
+                                            if res[0] != "ERROR":
+                                                procesado_con_exito = True
 
                         except Exception as e_correo:
                             console.print(f"[bold red]⚠️ Error procesando el correo {message_id}: {e_correo}[/bold red]")
                             continue
                         
+                        # Solo marcamos como leído si no hubo un crash de integridad o estructura XML
                         if procesado_con_exito:
                             mail.store(num, '+FLAGS', '\\Seen')
 
