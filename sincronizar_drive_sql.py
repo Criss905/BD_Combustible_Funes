@@ -16,7 +16,7 @@ from rich.panel import Panel
 load_dotenv()
 console = Console()
 
-# Asegúrate de configurar este ID en tus secretos o .env en el futuro
+# ID del documento en Google Sheets (configurable desde variables de entorno)
 ID_GOOGLE_SHEET = os.getenv("ID_GOOGLE_SHEET", "1B3X4oKZ-BAdC_Rp4b9RNbeO-jzOHdrRYqiIYNcB5vq4")
 
 DB_CONFIG = {
@@ -38,11 +38,31 @@ def conectar_google_sheets():
         raise ValueError(f"Fallo en credenciales de Drive: {e}")
 
 def limpiar_string(valor):
-    """Convierte cadenas vacías de Google Sheets a None (NULL en SQL)"""
+    """Convierte cadenas vacías de Google Sheets a None (NULL en SQL) y corrige codificación UTF-8"""
     if valor is None:
         return None
     val_str = str(valor).strip()
-    return val_str if val_str != "" else None
+    if val_str == "":
+        return None
+    try:
+        # Fuerza la recodificación de lecturas Latin-1 de vuelta a UTF-8
+        val_str = val_str.encode('latin1').decode('utf-8')
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return val_str
+
+def limpiar_placa(fila):
+    """Extrae la placa, repara la codificación Latin-1 -> UTF-8 y normaliza en mayúsculas"""
+    placa_cruda = str(fila.get('placa', '')).strip().upper()
+    if not placa_cruda:
+        return None
+    try:
+        # Fuerza la recodificación a UTF-8
+        placa = placa_cruda.encode('latin1').decode('utf-8').upper()
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        # Si la cadena ya estaba sana, la deja igual
+        placa = placa_cruda
+    return placa
 
 def formatear_fecha(fecha_cruda):
     """Intenta convertir fechas latinas (DD/MM/YYYY) al estándar ISO de PostgreSQL"""
@@ -71,16 +91,16 @@ def ejecutar_sincronizacion():
                 try:
                     records_c = hoja.worksheet("Dim_Contratos").get_all_records()
                     valores_c = []
-                    for r in records_c:
-                        id_c = limpiar_string(r.get('id_contrato'))
+                    for fila in records_c:
+                        id_c = limpiar_string(fila.get('id_contrato'))
                         if id_c:  # Solo procesa si hay un ID válido
-                            presupuesto = r.get('presupuesto_total')
+                            presupuesto = fila.get('presupuesto_total')
                             # Asegurar que el presupuesto sea un número flotante válido
                             presupuesto = float(presupuesto) if presupuesto not in ["", None] else 0.0
                             valores_c.append((
                                 id_c,
-                                limpiar_string(r.get('bolsa')),
-                                limpiar_string(r.get('estado')) or 'ACTIVO',
+                                limpiar_string(fila.get('bolsa')),
+                                limpiar_string(fila.get('estado')) or 'ACTIVO',
                                 presupuesto
                             ))
                     
@@ -97,6 +117,7 @@ def ejecutar_sincronizacion():
                         conn.commit()
                         console.print(f"[green] ✅ Contratos sincronizados: {len(valores_c)}[/green]")
                 except Exception as e:
+                    conn.rollback()
                     console.print(f"[yellow]⚠️ Omitiendo Contratos o error al leer hoja: {e}[/yellow]")
 
                 # --- B. SINCRONIZAR VEHÍCULOS (BATCH) ---
@@ -104,16 +125,14 @@ def ejecutar_sincronizacion():
                 try:
                     records_v = hoja.worksheet("Dim_Vehiculos").get_all_records()
                     valores_v = []
-                    for r in records_v:
-                        placa = limpiar_string(r.get('placa'))
+                    for fila in records_v:
+                        placa = limpiar_placa(fila)
                         if placa:
-                            # === DATA WRANGLING: Normalización de placas ===
-                            placa = placa.strip().upper()
                             valores_v.append((
                                 placa,
-                                limpiar_string(r.get('tipo_vehiculo')),
-                                limpiar_string(r.get('estado')) or 'ACTIVO',
-                                limpiar_string(r.get('bolsa'))
+                                limpiar_string(fila.get('tipo_vehiculo')),
+                                limpiar_string(fila.get('estado')) or 'ACTIVO',
+                                limpiar_string(fila.get('bolsa'))
                             ))
                     
                     if valores_v:
@@ -129,22 +148,23 @@ def ejecutar_sincronizacion():
                         conn.commit()
                         console.print(f"[green] ✅ Vehículos sincronizados: {len(valores_v)}[/green]")
                 except Exception as e:
+                    conn.rollback()
                     console.print(f"[yellow]⚠️ Omitiendo Vehículos o error al leer hoja: {e}[/yellow]")
 
-                # --- C. SINCRONIZAR PERSONAL (NUEVO PASO PARA LA BITÁCORA) ---
+                # --- C. SINCRONIZAR PERSONAL (BATCH) ---
                 console.print("Sincronizando [bold]Dim_Personal[/bold]...")
                 try:
                     records_p = hoja.worksheet("Dim_Personal").get_all_records()
                     valores_p = []
-                    for r in records_p:
-                        id_p = limpiar_string(r.get('id_personal'))
-                        nombre = limpiar_string(r.get('nombre'))
+                    for fila in records_p:
+                        id_p = limpiar_string(fila.get('id_personal'))
+                        nombre = limpiar_string(fila.get('nombre'))
                         if id_p and nombre:
                             valores_p.append((
                                 id_p,
                                 nombre,
-                                limpiar_string(r.get('cargo')),
-                                limpiar_string(r.get('tipo_vinculacion'))
+                                limpiar_string(fila.get('cargo')),
+                                limpiar_string(fila.get('tipo_vinculacion'))
                             ))
                     
                     if valores_p:
@@ -160,6 +180,7 @@ def ejecutar_sincronizacion():
                         conn.commit()
                         console.print(f"[green] ✅ Personal sincronizado: {len(valores_p)}[/green]")
                 except Exception as e:
+                    conn.rollback()
                     console.print(f"[yellow]⚠️ Omitiendo Personal o no existe la hoja aún: {e}[/yellow]")
 
                 # --- D. SINCRONIZAR VALES (BATCH) ---
@@ -167,28 +188,30 @@ def ejecutar_sincronizacion():
                 try:
                     records_val = hoja.worksheet("Fact_Vales").get_all_records()
                     valores_val = []
-                    for r in records_val:
-                        placa = limpiar_string(r.get('placa'))
-                        id_contrato = limpiar_string(r.get('id_contrato'))
+                    for fila in records_val:
+                        placa = limpiar_placa(fila)
+                        id_contrato = limpiar_string(fila.get('id_contrato'))
                         
                         # Validación estricta NOT NULL
                         if placa and id_contrato:
-                            placa = placa.strip().upper()
-                            id_vale = limpiar_string(r.get('id_vale'))
+                            id_vale = limpiar_string(fila.get('id_vale'))
                             if not id_vale:
                                 id_vale = str(uuid.uuid4())[:8]
                                 
-                            num_fisico = r.get('num_vale_fisico')
+                            num_fisico = fila.get('num_vale_fisico')
                             num_fisico = int(num_fisico) if num_fisico not in ["", None] else None
                             
-                            gals = r.get('galones_autorizados')
+                            gals = fila.get('galones_autorizados')
                             gals = float(gals) if gals not in ["", None] else 0.0
                             
-                            fecha_iso = formatear_fecha(r.get('fecha_emision'))
-                            # === DATA WRANGLING: Generación de Llave Temporal (date_key) ===
-                            date_key = int(fecha_iso.replace('-', '')) if fecha_iso else None
+                            fecha_iso = formatear_fecha(fila.get('fecha_emision'))
+                            # === DATA WRANGLING: Llave Temporal (date_key) a prueba de texto ===
+                            try:
+                                date_key = int(fecha_iso[:10].replace('-', '')) if fecha_iso else None
+                            except ValueError:
+                                date_key = None  # Convierte textos inválidos en nulo
                             
-                            # Omitir si la fecha es nula, ya que requerimos date_key
+                            # Omitir si la fecha es nula o inválida, ya que requerimos date_key
                             if date_key is not None:
                                 valores_val.append((
                                     id_vale,
@@ -216,6 +239,7 @@ def ejecutar_sincronizacion():
                         conn.commit()
                         console.print(f"[green] ✅ Vales procesados: {len(valores_val)}[/green]")
                 except Exception as e:
+                    conn.rollback()
                     console.print(f"[red]❌ Error al procesar Vales: {e}[/red]")
                     
                 # --- E. SINCRONIZAR BITÁCORA (BATCH) ---
@@ -223,17 +247,27 @@ def ejecutar_sincronizacion():
                 try:
                     records_b = hoja.worksheet("Fact_Bitacora").get_all_records()
                     valores_b = []
-                    for r in records_b:
-                        id_bitacora = limpiar_string(r.get('id_bitacora'))
-                        placa = limpiar_string(r.get('placa'))
-                        fecha_cruda = r.get('fecha_actividad')
+                    for fila in records_b:
+                        id_bitacora = limpiar_string(fila.get('id_bitacora'))
+                        fecha_cruda = fila.get('fecha_actividad')
+                        
+                        # Convertimos la lectura corrupta (Latin-1) de vuelta a su formato original (UTF-8)
+                        placa_cruda = str(fila.get('placa', '')).strip().upper()
+                        try:
+                            # Fuerza la recodificación a UTF-8
+                            placa = placa_cruda.encode('latin1').decode('utf-8').upper()
+                        except (UnicodeEncodeError, UnicodeDecodeError):
+                            # Si la cadena ya estaba sana, la deja igual
+                            placa = placa_cruda
                         
                         # Exigir placa NOT NULL y fecha válida
                         if id_bitacora and placa and fecha_cruda:
-                            placa = placa.strip().upper()
                             fecha_iso = formatear_fecha(fecha_cruda)
-                            # === DATA WRANGLING: Generación de date_key ===
-                            date_key = int(fecha_iso.replace('-', '')) if fecha_iso else None
+                            # === DATA WRANGLING: Llave Temporal (date_key) a prueba de texto ===
+                            try:
+                                date_key = int(fecha_iso[:10].replace('-', '')) if fecha_iso else None
+                            except ValueError:
+                                date_key = None
                             
                             if date_key is not None:
                                 valores_b.append((
@@ -241,11 +275,11 @@ def ejecutar_sincronizacion():
                                     placa,
                                     fecha_iso,
                                     date_key,
-                                    limpiar_string(r.get('lugar_recorrido')),
-                                    limpiar_string(r.get('actividad_desarrollada')),
-                                    limpiar_string(r.get('id_conductor')),
-                                    limpiar_string(r.get('id_responsable_1')),
-                                    limpiar_string(r.get('id_responsable_2'))
+                                    limpiar_string(fila.get('lugar_recorrido')),
+                                    limpiar_string(fila.get('actividad_desarrollada')),
+                                    limpiar_string(fila.get('id_conductor')),
+                                    limpiar_string(fila.get('id_responsable_1')),
+                                    limpiar_string(fila.get('id_responsable_2'))
                                 ))
 
                     if valores_b:
@@ -270,6 +304,7 @@ def ejecutar_sincronizacion():
                         conn.commit()
                         console.print(f"[green] ✅ Bitácora procesada: {len(valores_b)}[/green]")
                 except Exception as e:
+                    conn.rollback()
                     console.print(f"[yellow]⚠️ Omitiendo Bitácora o no existe la hoja aún: {e}[/yellow]")
 
         console.print("\n[bold green]💾 Sincronización exitosa. Base de datos Cloud actualizada mediante transacciones en bloque.[/bold green]")
