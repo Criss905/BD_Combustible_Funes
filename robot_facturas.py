@@ -1,6 +1,7 @@
 import os
 import imaplib
 import email
+from email.header import decode_header
 import zipfile
 import glob
 import psycopg2
@@ -34,9 +35,23 @@ DB_CONFIG = {
 EMAIL_USER = os.getenv('EMAIL_USER')
 EMAIL_PASS = os.getenv('EMAIL_PASS')
 
-# Limpieza estricta de variables de entorno para evitar saltos de línea y errores
-REMITENTE_ESTACION = os.getenv('REMITENTE_ESTACION', 'facturacion@elplacer.com').strip()
+# Identificadores del proveedor y nomenclatura DIAN
+NIT_PROVEEDOR = os.getenv('NIT_PROVEEDOR', '814003956').strip()
 ASUNTO_ESTACION = os.getenv('ASUNTO_ESTACION', 'EL PLACER LTDA').strip()
+
+# Lista blanca de correos oficiales autorizados (directos y rebotes internos)
+REMITENTES_OFICIALES = (
+    'factura@transaccionesco.siigo.net',
+    'secretariadegobierno@funes-narino.gov.co',
+    'alcaldia@funes-narino.gov.co',
+    os.getenv('REMITENTE_ESTACION', 'facturacion@elplacer.com').strip().lower()
+)
+
+# Expresión regular oficial DIAN: NIT;RAZON_SOCIAL;PREFIJO_CONSECUTIVO(PIEF/PLAC/otra);COD_DOC;RAZON_SOCIAL
+REGEX_ASUNTO_DIAN = re.compile(
+    r'814003956\s*;\s*EL PLACER LTDA\s*;\s*([A-Z0-9\-]+)\s*;\s*(\d{2})',
+    re.IGNORECASE
+)
 
 # Catálogo global de alias
 MAQUINARIA_ESPECIAL = {
@@ -48,6 +63,18 @@ MAQUINARIA_ESPECIAL = {
     "VIBROCOMPACTADOR": ["VIBROCOMPACTADOR", "VIBRO COMPACTADOR", "VIBRO"],
     "NC6574": ["NC6574", "NCG574", "NCG 574"]
 }
+
+def decodificar_encabezado_mime(valor_crudo):
+    if not valor_crudo:
+        return ""
+    partes = decode_header(valor_crudo)
+    texto_limpio = []
+    for fragmento, codificacion in partes:
+        if isinstance(fragmento, bytes):
+            texto_limpio.append(fragmento.decode(codificacion or 'utf-8', errors='ignore'))
+        else:
+            texto_limpio.append(str(fragmento))
+    return "".join(texto_limpio).strip()
 
 def conectar_gmail():
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -122,12 +149,16 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
         f_root = ET.fromstring(xml_interno.text)
         
         nodo_id = f_root.find('./cbc:ID', ns)
-        if nodo_id is not None: num_factura = nodo_id.text
-        else: requiere_revision = True
+        if nodo_id is not None and nodo_id.text:
+            num_factura = nodo_id.text.strip()
+        else:
+            requiere_revision = True
 
         nodo_cufe = f_root.find('.//cbc:UUID', ns)
-        if nodo_cufe is not None: cufe = nodo_cufe.text
-        else: requiere_revision = True
+        if nodo_cufe is not None and nodo_cufe.text:
+            cufe = nodo_cufe.text.strip()
+        else:
+            requiere_revision = True
 
         # Prevenir duplicados lógicos (Idempotencia)
         cursor.execute("SELECT 1 FROM fact_facturas WHERE cufe = %s OR num_factura_estacion = %s", (cufe, num_factura))
@@ -165,8 +196,8 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
             requiere_revision = True
 
         nodo_fecha = f_root.find('.//cbc:IssueDate', ns)
-        if nodo_fecha is not None: 
-            fecha = nodo_fecha.text
+        if nodo_fecha is not None and nodo_fecha.text: 
+            fecha = nodo_fecha.text.strip()
             # === 2. DATA WRANGLING: Creación de la Llave Temporal (date_key) ===
             date_key = int(fecha.replace("-", ""))
         else: 
@@ -175,22 +206,28 @@ def procesar_xml_blindado(ruta_xml, message_id, cursor, conn, placas_autorizadas
         try:
             total_nodo = f_root.find('.//cac:LegalMonetaryTotal/cbc:PayableAmount', ns)
             total = Decimal(total_nodo.text) if total_nodo is not None else Decimal('0.00')
-        except: requiere_revision = True
+        except Exception:
+            requiere_revision = True
             
         try:
             v_unit_nodo = f_root.find('.//cac:Price/cbc:PriceAmount', ns)
             v_unit = Decimal(v_unit_nodo.text) if v_unit_nodo is not None else Decimal('0.00')
-        except: requiere_revision = True
+        except Exception:
+            requiere_revision = True
             
         try:
             gals_nodo = f_root.find('.//cbc:InvoicedQuantity', ns)
-            if gals_nodo is None: gals_nodo = f_root.find('.//cbc:CreditedQuantity', ns)
+            if gals_nodo is None:
+                gals_nodo = f_root.find('.//cbc:CreditedQuantity', ns)
             gals = Decimal(gals_nodo.text) if gals_nodo is not None else Decimal('0.00')
-        except: requiere_revision = True
+        except Exception:
+            requiere_revision = True
 
         if tipo_doc == "Nota de Credito":
-            if total and total > 0: total *= Decimal('-1')
-            if gals and gals > 0: gals *= Decimal('-1')
+            if total and total > 0:
+                total *= Decimal('-1')
+            if gals and gals > 0:
+                gals *= Decimal('-1')
 
         # === 3. CONCILIACIÓN INTELIGENTE (1:1 Vales vs Facturas) ===
         if placa != "SIN_PLACA" and fecha:
@@ -253,7 +290,7 @@ def procesar_facturas():
                 if not ids:
                     console.print("[yellow]📭 No hay correos nuevos para procesar en la bandeja.[/yellow]")
                 else:
-                    table = Table(title=f"Procesando documentos en la nube")
+                    table = Table(title="Procesando documentos en la nube")
                     table.add_column("Factura", style="cyan")
                     table.add_column("Auditoría", style="bold")
                     table.add_column("Total")
@@ -262,11 +299,15 @@ def procesar_facturas():
                         _, data = mail.fetch(num, "(BODY.PEEK[])")
                         msg = email.message_from_bytes(data[0][1])
                         
-                        # FILTRO DEFENSIVO EN PYTHON: Validamos remitente y asunto
-                        remitente_correo = msg.get('From', '')
-                        asunto_correo = msg.get('Subject', '')
+                        # FILTRO DEFENSIVO EN PYTHON: Decodificación MIME + Remitentes Oficiales + Estructura DIAN
+                        remitente_correo = decodificar_encabezado_mime(msg.get('From', '')).lower()
+                        asunto_correo = decodificar_encabezado_mime(msg.get('Subject', '')).upper()
                         
-                        if REMITENTE_ESTACION not in remitente_correo or ASUNTO_ESTACION not in asunto_correo:
+                        es_remitente_oficial = any(rem in remitente_correo for rem in REMITENTES_OFICIALES if rem)
+                        match_dian = REGEX_ASUNTO_DIAN.search(asunto_correo)
+                        es_asunto_valido = bool(match_dian) or (NIT_PROVEEDOR in asunto_correo) or (ASUNTO_ESTACION.upper() in asunto_correo)
+                        
+                        if not (es_remitente_oficial and es_asunto_valido):
                             continue
                         
                         message_id = msg.get('Message-ID', 'SIN_ID_CORREO')
@@ -274,10 +315,19 @@ def procesar_facturas():
 
                         try:
                             with tempfile.TemporaryDirectory() as DIR_TEMP:
+                                contador_zip = 0
                                 for part in msg.walk():
                                     nombre_archivo = part.get_filename()
+                                    if nombre_archivo:
+                                        nombre_archivo = decodificar_encabezado_mime(nombre_archivo)
                                     if nombre_archivo and nombre_archivo.lower().endswith('.zip'):
-                                        ruta_zip = sanitizar_ruta(DIR_TEMP, nombre_archivo)
+                                        contador_zip += 1
+                                        # Subcarpeta única por adjunto para hilos con múltiples reenvíos (Fwd: Fwd:)
+                                        sub_dir = os.path.join(DIR_TEMP, f"zip_{contador_zip}")
+                                        os.makedirs(sub_dir, exist_ok=True)
+                                        
+                                        nombre_seguro = os.path.basename(nombre_archivo)
+                                        ruta_zip = sanitizar_ruta(sub_dir, nombre_seguro)
                                         with open(ruta_zip, 'wb') as f:
                                             f.write(part.get_payload(decode=True))
 
@@ -288,10 +338,10 @@ def procesar_facturas():
                                                 if limite_seguridad > 20 * 1024 * 1024:
                                                     raise ValueError("Posible ZIP Bomb: Tamaño excede límite seguro.")
                                                 
-                                                sanitizar_ruta(DIR_TEMP, miembro.filename)
-                                                z.extract(miembro, DIR_TEMP)
+                                                sanitizar_ruta(sub_dir, miembro.filename)
+                                                z.extract(miembro, sub_dir)
                                         
-                                        xmls = glob.glob(os.path.join(DIR_TEMP, '*.xml'))
+                                        xmls = glob.glob(os.path.join(sub_dir, '*.xml'))
                                         
                                         for xml_doc in xmls:
                                             res = procesar_xml_blindado(xml_doc, message_id, cursor, conn, placas_autorizadas)
@@ -301,7 +351,7 @@ def procesar_facturas():
                                             elif res[0] == "SKIP":
                                                 table.add_row(res[1], "[bold cyan]⏭️ Omitido[/bold cyan]", "N/A")
                                             
-                                            # Si la factura fue conciliada o requiere revisión por datos, marcamos como exitosa 
+                                            # Si la factura fue conciliada, requiere revisión o ya existía (SKIP), marcamos como exitosa 
                                             # para el buzón. Si falló la estructura, no la marcamos como vista.
                                             if res[0] != "ERROR":
                                                 procesado_con_exito = True
