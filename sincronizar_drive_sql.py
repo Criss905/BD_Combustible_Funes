@@ -27,6 +27,15 @@ DB_CONFIG = {
     'port': os.getenv('DB_PORT')
 }
 
+# Mapa de reparación explícita de secuencias corruptas (Excel/openpyxl y Mojibake)
+REEMPLAZOS_MOJIBAKE = {
+    'Ã_x0091_': 'Ñ',
+    'Ã_X0091_': 'Ñ',
+    'Ã\x91': 'Ñ',
+    'Ã‘': 'Ñ',
+    'Ã±': 'ñ',
+}
+
 
 def conectar_google_sheets():
     console.print("[cyan]Conectando a Google Workspace (Zero Trust)...[/cyan]")
@@ -39,13 +48,21 @@ def conectar_google_sheets():
         raise ValueError(f"Fallo en credenciales de Drive: {e}")
 
 
+def normalizar_registro(fila):
+    """Elimina espacios accidentales en los nombres de encabezados (ej. 'tipo_vinculacion ')"""
+    return {str(k).strip(): v for k, v in fila.items()}
+
+
 def limpiar_string(valor):
-    """Convierte cadenas vacías de Google Sheets a None (NULL en SQL) y corrige codificación UTF-8"""
+    """Convierte cadenas vacías de Google Sheets a None (NULL en SQL) y repara codificación UTF-8"""
     if valor is None:
         return None
     val_str = str(valor).strip()
     if val_str == "":
         return None
+    for secuencia_rota, caracter_valido in REEMPLAZOS_MOJIBAKE.items():
+        if secuencia_rota in val_str:
+            val_str = val_str.replace(secuencia_rota, caracter_valido)
     try:
         # Fuerza la recodificación de lecturas Latin-1 de vuelta a UTF-8
         val_str = val_str.encode('latin1').decode('utf-8')
@@ -55,17 +72,11 @@ def limpiar_string(valor):
 
 
 def limpiar_placa(fila):
-    """Extrae la placa, repara la codificación Latin-1 -> UTF-8 y normaliza en mayúsculas"""
-    placa_cruda = str(fila.get('placa', '')).strip().upper()
-    if not placa_cruda:
+    """Extrae la placa, repara Mojibake/secuencias escapadas y normaliza en mayúsculas"""
+    placa = limpiar_string(fila.get('placa'))
+    if not placa:
         return None
-    try:
-        # Fuerza la recodificación a UTF-8
-        placa = placa_cruda.encode('latin1').decode('utf-8').upper()
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        # Si la cadena ya estaba sana, la deja igual
-        placa = placa_cruda
-    return placa
+    return placa.upper()
 
 
 def limpiar_float(valor, default=0.0):
@@ -119,10 +130,28 @@ def formatear_fecha(fecha_cruda):
     return texto
 
 
+def derivar_date_key(fecha_iso):
+    """Deriva la llave entera YYYYMMDD desde una fecha ISO válida; retorna None si es inválida"""
+    if not fecha_iso or len(fecha_iso) < 10:
+        return None
+    try:
+        return int(fecha_iso[:10].replace('-', ''))
+    except ValueError:
+        return None
+
+
+def deduplicar_por_pk(valores):
+    """Conserva el último registro por llave primaria (posición 0) para proteger ON CONFLICT"""
+    mapa = {}
+    for tupla in valores:
+        mapa[tupla[0]] = tupla
+    return list(mapa.values())
+
+
 def ejecutar_sincronizacion():
     console.print(Panel.fit(
         "[bold blue]🔄 SINCRONIZADOR CLOUD (APPSHEET -> SUPABASE)[/bold blue]",
-        subtitle="Operaciones Batch + Integridad Estricta"
+        subtitle="Operaciones Batch + Integridad Estricta + Saneamiento UTF-8"
     ))
 
     if not all([os.getenv('DB_HOST'), os.getenv('DB_PASS')]):
@@ -140,7 +169,9 @@ def ejecutar_sincronizacion():
                 try:
                     records_c = hoja.worksheet("Dim_Contratos").get_all_records()
                     valores_c = []
-                    for fila in records_c:
+                    omitidos_c = 0
+                    for fila_cruda in records_c:
+                        fila = normalizar_registro(fila_cruda)
                         id_c = limpiar_string(fila.get('id_contrato'))
                         fecha_ini = formatear_fecha(fila.get('fecha_inicio'))
                         if id_c and fecha_ini:
@@ -160,7 +191,10 @@ def ejecutar_sincronizacion():
                                 fecha_fin,
                                 dias_tramite
                             ))
+                        else:
+                            omitidos_c += 1
 
+                    valores_c = deduplicar_por_pk(valores_c)
                     if valores_c:
                         query_c = """
                             INSERT INTO dim_contratos (
@@ -187,6 +221,8 @@ def ejecutar_sincronizacion():
 
                         conn.commit()
                         console.print(f"[green] ✅ Contratos sincronizados: {len(valores_c)}[/green]")
+                    if omitidos_c:
+                        console.print(f"[yellow] ⚠️ Contratos omitidos por ID o fecha_inicio vacía: {omitidos_c}[/yellow]")
                 except Exception as e:
                     conn.rollback()
                     console.print(f"[yellow]⚠️ Omitiendo Contratos o error al leer hoja: {e}[/yellow]")
@@ -196,18 +232,22 @@ def ejecutar_sincronizacion():
                 try:
                     records_v = hoja.worksheet("Dim_Vehiculos").get_all_records()
                     valores_v = []
-                    for fila in records_v:
+                    for fila_cruda in records_v:
+                        fila = normalizar_registro(fila_cruda)
                         placa = limpiar_placa(fila)
                         if placa:
                             bolsa_v = limpiar_string(fila.get('bolsa'))
                             bolsa_v = bolsa_v.upper() if bolsa_v else None
+                            estado_v = limpiar_string(fila.get('estado'))
+                            estado_v = estado_v.upper() if estado_v else 'ACTIVO'
                             valores_v.append((
                                 placa,
                                 limpiar_string(fila.get('tipo_vehiculo')),
-                                limpiar_string(fila.get('estado')) or 'ACTIVO',
+                                estado_v,
                                 bolsa_v
                             ))
 
+                    valores_v = deduplicar_por_pk(valores_v)
                     if valores_v:
                         query_v = """
                             INSERT INTO dim_vehiculos (placa, tipo_vehiculo, estado, bolsa)
@@ -229,7 +269,8 @@ def ejecutar_sincronizacion():
                 try:
                     records_p = hoja.worksheet("Dim_Personal").get_all_records()
                     valores_p = []
-                    for fila in records_p:
+                    for fila_cruda in records_p:
+                        fila = normalizar_registro(fila_cruda)
                         id_p = limpiar_string(fila.get('id_personal'))
                         nombre = limpiar_string(fila.get('nombre'))
                         if id_p and nombre:
@@ -240,6 +281,7 @@ def ejecutar_sincronizacion():
                                 limpiar_string(fila.get('tipo_vinculacion'))
                             ))
 
+                    valores_p = deduplicar_por_pk(valores_p)
                     if valores_p:
                         query_p = """
                             INSERT INTO dim_personal (id_personal, nombre, cargo, tipo_vinculacion)
@@ -261,37 +303,36 @@ def ejecutar_sincronizacion():
                 try:
                     records_val = hoja.worksheet("Fact_Vales").get_all_records()
                     valores_val = []
-                    for fila in records_val:
+                    omitidos_val = 0
+                    for fila_cruda in records_val:
+                        fila = normalizar_registro(fila_cruda)
                         placa = limpiar_placa(fila)
                         id_contrato = limpiar_string(fila.get('id_contrato'))
+                        fecha_iso = formatear_fecha(fila.get('fecha_emision'))
+                        date_key = derivar_date_key(fecha_iso)
 
                         # Validación estricta NOT NULL
-                        if placa and id_contrato:
+                        if placa and id_contrato and date_key is not None:
                             id_vale = limpiar_string(fila.get('id_vale'))
                             if not id_vale:
                                 id_vale = str(uuid.uuid4())[:8]
 
                             num_fisico = limpiar_string(fila.get('num_vale_fisico'))
                             gals = limpiar_float(fila.get('galones_autorizados'), 0.0)
-                            fecha_iso = formatear_fecha(fila.get('fecha_emision'))
 
-                            # === DATA WRANGLING: Llave Temporal (date_key) a prueba de texto ===
-                            try:
-                                date_key = int(fecha_iso[:10].replace('-', '')) if fecha_iso else None
-                            except ValueError:
-                                date_key = None
+                            valores_val.append((
+                                id_vale,
+                                num_fisico,
+                                fecha_iso,
+                                date_key,
+                                placa,
+                                id_contrato,
+                                gals
+                            ))
+                        else:
+                            omitidos_val += 1
 
-                            if date_key is not None:
-                                valores_val.append((
-                                    id_vale,
-                                    num_fisico,
-                                    fecha_iso,
-                                    date_key,
-                                    placa,
-                                    id_contrato,
-                                    gals
-                                ))
-
+                    valores_val = deduplicar_por_pk(valores_val)
                     if valores_val:
                         query_val = """
                             INSERT INTO fact_vales (
@@ -310,6 +351,8 @@ def ejecutar_sincronizacion():
                         psycopg2.extras.execute_values(cursor, query_val, valores_val)
                         conn.commit()
                         console.print(f"[green] ✅ Vales procesados: {len(valores_val)}[/green]")
+                    if omitidos_val:
+                        console.print(f"[yellow] ⚠️ Vales omitidos por placa/contrato/fecha inválida: {omitidos_val}[/yellow]")
                 except Exception as e:
                     conn.rollback()
                     console.print(f"[red]❌ Error al procesar Vales: {e}[/red]")
@@ -319,32 +362,31 @@ def ejecutar_sincronizacion():
                 try:
                     records_b = hoja.worksheet("Fact_Bitacora").get_all_records()
                     valores_b = []
-                    for fila in records_b:
+                    omitidos_b = 0
+                    for fila_cruda in records_b:
+                        fila = normalizar_registro(fila_cruda)
                         id_bitacora = limpiar_string(fila.get('id_bitacora'))
-                        fecha_cruda = fila.get('fecha_actividad')
                         placa = limpiar_placa(fila)
+                        fecha_iso = formatear_fecha(fila.get('fecha_actividad'))
+                        date_key = derivar_date_key(fecha_iso)
 
-                        # Exigir placa NOT NULL y fecha válida
-                        if id_bitacora and placa and fecha_cruda:
-                            fecha_iso = formatear_fecha(fecha_cruda)
-                            try:
-                                date_key = int(fecha_iso[:10].replace('-', '')) if fecha_iso else None
-                            except ValueError:
-                                date_key = None
+                        # Exigir PK, placa NOT NULL y fecha válida
+                        if id_bitacora and placa and date_key is not None:
+                            valores_b.append((
+                                id_bitacora,
+                                placa,
+                                fecha_iso,
+                                date_key,
+                                limpiar_string(fila.get('lugar_recorrido')),
+                                limpiar_string(fila.get('actividad_desarrollada')),
+                                limpiar_string(fila.get('id_conductor')),
+                                limpiar_string(fila.get('id_responsable_1')),
+                                limpiar_string(fila.get('id_responsable_2'))
+                            ))
+                        else:
+                            omitidos_b += 1
 
-                            if date_key is not None:
-                                valores_b.append((
-                                    id_bitacora,
-                                    placa,
-                                    fecha_iso,
-                                    date_key,
-                                    limpiar_string(fila.get('lugar_recorrido')),
-                                    limpiar_string(fila.get('actividad_desarrollada')),
-                                    limpiar_string(fila.get('id_conductor')),
-                                    limpiar_string(fila.get('id_responsable_1')),
-                                    limpiar_string(fila.get('id_responsable_2'))
-                                ))
-
+                    valores_b = deduplicar_por_pk(valores_b)
                     if valores_b:
                         query_b = """
                             INSERT INTO fact_bitacora (
@@ -366,6 +408,8 @@ def ejecutar_sincronizacion():
                         psycopg2.extras.execute_values(cursor, query_b, valores_b)
                         conn.commit()
                         console.print(f"[green] ✅ Bitácora procesada: {len(valores_b)}[/green]")
+                    if omitidos_b:
+                        console.print(f"[yellow] ⚠️ Registros de bitácora omitidos por ID/placa/fecha inválida: {omitidos_b}[/yellow]")
                 except Exception as e:
                     conn.rollback()
                     console.print(f"[yellow]⚠️ Omitiendo Bitácora o no existe la hoja aún: {e}[/yellow]")
