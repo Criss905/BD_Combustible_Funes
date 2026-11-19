@@ -27,6 +27,7 @@ DB_CONFIG = {
     'port': os.getenv('DB_PORT')
 }
 
+
 def conectar_google_sheets():
     console.print("[cyan]Conectando a Google Workspace (Zero Trust)...[/cyan]")
     alcance = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -36,6 +37,7 @@ def conectar_google_sheets():
         return cliente.open_by_key(ID_GOOGLE_SHEET)
     except Exception as e:
         raise ValueError(f"Fallo en credenciales de Drive: {e}")
+
 
 def limpiar_string(valor):
     """Convierte cadenas vacías de Google Sheets a None (NULL en SQL) y corrige codificación UTF-8"""
@@ -51,6 +53,7 @@ def limpiar_string(valor):
         pass
     return val_str
 
+
 def limpiar_placa(fila):
     """Extrae la placa, repara la codificación Latin-1 -> UTF-8 y normaliza en mayúsculas"""
     placa_cruda = str(fila.get('placa', '')).strip().upper()
@@ -64,28 +67,74 @@ def limpiar_placa(fila):
         placa = placa_cruda
     return placa
 
-def formatear_fecha(fecha_cruda):
-    """Intenta convertir fechas latinas (DD/MM/YYYY) al estándar ISO de PostgreSQL"""
-    if not fecha_cruda:
-        return None
+
+def limpiar_float(valor, default=0.0):
+    """Convierte números o cadenas monetarias de Google Sheets a float seguro"""
+    if valor in ("", None):
+        return default
+    if isinstance(valor, (int, float)):
+        return float(valor)
+    texto = str(valor).replace('$', '').replace(',', '').strip()
     try:
-        return datetime.strptime(str(fecha_cruda).strip(), '%d/%m/%Y').strftime('%Y-%m-%d')
+        return float(texto)
     except ValueError:
-        return str(fecha_cruda).strip()
+        return default
+
+
+def limpiar_int(valor, default=30):
+    """Convierte un valor de Google Sheets a entero seguro"""
+    if valor in ("", None):
+        return default
+    try:
+        return int(float(str(valor).strip()))
+    except ValueError:
+        return default
+
+
+def normalizar_estado_contrato(valor):
+    """Normaliza variaciones de escritura en el estado del contrato"""
+    texto = limpiar_string(valor)
+    if not texto:
+        return 'Activo'
+    upper = texto.upper()
+    if upper in ('ACTIVO', 'ACTIVA'):
+        return 'Activo'
+    if upper in ('FINALIZADO', 'FINALIZADA', 'CERRADO', 'CERRADA', 'VENCIDO', 'VENCIDA'):
+        return 'Finalizado'
+    return texto
+
+
+def formatear_fecha(fecha_cruda):
+    """Convierte fechas de Google Sheets (DD/MM/YYYY o ISO) al estándar YYYY-MM-DD de PostgreSQL"""
+    if fecha_cruda is None:
+        return None
+    texto = str(fecha_cruda).strip()
+    if not texto:
+        return None
+    for fmt in ('%d/%m/%Y', '%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y %H:%M:%S', '%Y-%m-%d %H:%M:%S'):
+        try:
+            return datetime.strptime(texto, fmt).strftime('%Y-%m-%d')
+        except ValueError:
+            continue
+    return texto
+
 
 def ejecutar_sincronizacion():
-    console.print(Panel.fit("[bold blue]🔄 SINCRONIZADOR CLOUD (APPSHEET -> SUPABASE)[/bold blue]", subtitle="Operaciones Batch + Integridad Estricta"))
-    
+    console.print(Panel.fit(
+        "[bold blue]🔄 SINCRONIZADOR CLOUD (APPSHEET -> SUPABASE)[/bold blue]",
+        subtitle="Operaciones Batch + Integridad Estricta"
+    ))
+
     if not all([os.getenv('DB_HOST'), os.getenv('DB_PASS')]):
         console.print("[bold red]❌ Error: Faltan credenciales de base de datos.[/bold red]")
         sys.exit(1)
 
     try:
         hoja = conectar_google_sheets()
-        
+
         with psycopg2.connect(**DB_CONFIG) as conn:
             with conn.cursor() as cursor:
-                
+
                 # --- A. SINCRONIZAR CONTRATOS (BATCH) ---
                 console.print("Sincronizando [bold]Dim_Contratos[/bold]...")
                 try:
@@ -93,27 +142,49 @@ def ejecutar_sincronizacion():
                     valores_c = []
                     for fila in records_c:
                         id_c = limpiar_string(fila.get('id_contrato'))
-                        if id_c:  # Solo procesa si hay un ID válido
-                            presupuesto = fila.get('presupuesto_total')
-                            # Asegurar que el presupuesto sea un número flotante válido
-                            presupuesto = float(presupuesto) if presupuesto not in ["", None] else 0.0
+                        fecha_ini = formatear_fecha(fila.get('fecha_inicio'))
+                        if id_c and fecha_ini:
+                            bolsa_c = limpiar_string(fila.get('bolsa'))
+                            bolsa_c = bolsa_c.upper() if bolsa_c else None
+                            presupuesto = limpiar_float(fila.get('presupuesto_total'), 0.0)
+                            fecha_fin = formatear_fecha(fila.get('fecha_fin_real'))
+                            dias_tramite = limpiar_int(fila.get('dias_tramite_nuevo'), 30)
+                            estado_c = normalizar_estado_contrato(fila.get('estado'))
+
                             valores_c.append((
                                 id_c,
-                                limpiar_string(fila.get('bolsa')),
-                                limpiar_string(fila.get('estado')) or 'ACTIVO',
-                                presupuesto
+                                bolsa_c,
+                                estado_c,
+                                presupuesto,
+                                fecha_ini,
+                                fecha_fin,
+                                dias_tramite
                             ))
-                    
+
                     if valores_c:
                         query_c = """
-                            INSERT INTO dim_contratos (id_contrato, bolsa, estado, presupuesto_total)
+                            INSERT INTO dim_contratos (
+                                id_contrato, bolsa, estado, presupuesto_total,
+                                fecha_inicio, fecha_fin_real, dias_tramite_nuevo
+                            )
                             VALUES %s
                             ON CONFLICT (id_contrato) DO UPDATE SET
                                 bolsa = EXCLUDED.bolsa,
                                 estado = EXCLUDED.estado,
-                                presupuesto_total = EXCLUDED.presupuesto_total;
+                                presupuesto_total = EXCLUDED.presupuesto_total,
+                                fecha_inicio = EXCLUDED.fecha_inicio,
+                                fecha_fin_real = EXCLUDED.fecha_fin_real,
+                                dias_tramite_nuevo = EXCLUDED.dias_tramite_nuevo;
                         """
-                        psycopg2.extras.execute_values(cursor, query_c, valores_c)
+                        # Primero actualizar/insertar contratos cerrados (libera el índice único de bolsa abierta)
+                        cerrados_c = [v for v in valores_c if v[5] is not None]
+                        abiertos_c = [v for v in valores_c if v[5] is None]
+
+                        if cerrados_c:
+                            psycopg2.extras.execute_values(cursor, query_c, cerrados_c)
+                        if abiertos_c:
+                            psycopg2.extras.execute_values(cursor, query_c, abiertos_c)
+
                         conn.commit()
                         console.print(f"[green] ✅ Contratos sincronizados: {len(valores_c)}[/green]")
                 except Exception as e:
@@ -128,13 +199,15 @@ def ejecutar_sincronizacion():
                     for fila in records_v:
                         placa = limpiar_placa(fila)
                         if placa:
+                            bolsa_v = limpiar_string(fila.get('bolsa'))
+                            bolsa_v = bolsa_v.upper() if bolsa_v else None
                             valores_v.append((
                                 placa,
                                 limpiar_string(fila.get('tipo_vehiculo')),
                                 limpiar_string(fila.get('estado')) or 'ACTIVO',
-                                limpiar_string(fila.get('bolsa'))
+                                bolsa_v
                             ))
-                    
+
                     if valores_v:
                         query_v = """
                             INSERT INTO dim_vehiculos (placa, tipo_vehiculo, estado, bolsa)
@@ -166,7 +239,7 @@ def ejecutar_sincronizacion():
                                 limpiar_string(fila.get('cargo')),
                                 limpiar_string(fila.get('tipo_vinculacion'))
                             ))
-                    
+
                     if valores_p:
                         query_p = """
                             INSERT INTO dim_personal (id_personal, nombre, cargo, tipo_vinculacion)
@@ -191,27 +264,23 @@ def ejecutar_sincronizacion():
                     for fila in records_val:
                         placa = limpiar_placa(fila)
                         id_contrato = limpiar_string(fila.get('id_contrato'))
-                        
+
                         # Validación estricta NOT NULL
                         if placa and id_contrato:
                             id_vale = limpiar_string(fila.get('id_vale'))
                             if not id_vale:
                                 id_vale = str(uuid.uuid4())[:8]
-                                
-                            num_fisico = fila.get('num_vale_fisico')
-                            num_fisico = int(num_fisico) if num_fisico not in ["", None] else None
-                            
-                            gals = fila.get('galones_autorizados')
-                            gals = float(gals) if gals not in ["", None] else 0.0
-                            
+
+                            num_fisico = limpiar_string(fila.get('num_vale_fisico'))
+                            gals = limpiar_float(fila.get('galones_autorizados'), 0.0)
                             fecha_iso = formatear_fecha(fila.get('fecha_emision'))
+
                             # === DATA WRANGLING: Llave Temporal (date_key) a prueba de texto ===
                             try:
                                 date_key = int(fecha_iso[:10].replace('-', '')) if fecha_iso else None
                             except ValueError:
-                                date_key = None  # Convierte textos inválidos en nulo
-                            
-                            # Omitir si la fecha es nula o inválida, ya que requerimos date_key
+                                date_key = None
+
                             if date_key is not None:
                                 valores_val.append((
                                     id_vale,
@@ -225,7 +294,10 @@ def ejecutar_sincronizacion():
 
                     if valores_val:
                         query_val = """
-                            INSERT INTO fact_vales (id_vale, num_vale_fisico, fecha_emision, date_key, placa, id_contrato, galones_autorizados)
+                            INSERT INTO fact_vales (
+                                id_vale, num_vale_fisico, fecha_emision, date_key,
+                                placa, id_contrato, galones_autorizados
+                            )
                             VALUES %s
                             ON CONFLICT (id_vale) DO UPDATE SET
                                 num_vale_fisico = EXCLUDED.num_vale_fisico,
@@ -241,7 +313,7 @@ def ejecutar_sincronizacion():
                 except Exception as e:
                     conn.rollback()
                     console.print(f"[red]❌ Error al procesar Vales: {e}[/red]")
-                    
+
                 # --- E. SINCRONIZAR BITÁCORA (BATCH) ---
                 console.print("Sincronizando [bold]Fact_Bitacora[/bold]...")
                 try:
@@ -250,25 +322,16 @@ def ejecutar_sincronizacion():
                     for fila in records_b:
                         id_bitacora = limpiar_string(fila.get('id_bitacora'))
                         fecha_cruda = fila.get('fecha_actividad')
-                        
-                        # Convertimos la lectura corrupta (Latin-1) de vuelta a su formato original (UTF-8)
-                        placa_cruda = str(fila.get('placa', '')).strip().upper()
-                        try:
-                            # Fuerza la recodificación a UTF-8
-                            placa = placa_cruda.encode('latin1').decode('utf-8').upper()
-                        except (UnicodeEncodeError, UnicodeDecodeError):
-                            # Si la cadena ya estaba sana, la deja igual
-                            placa = placa_cruda
-                        
+                        placa = limpiar_placa(fila)
+
                         # Exigir placa NOT NULL y fecha válida
                         if id_bitacora and placa and fecha_cruda:
                             fecha_iso = formatear_fecha(fecha_cruda)
-                            # === DATA WRANGLING: Llave Temporal (date_key) a prueba de texto ===
                             try:
                                 date_key = int(fecha_iso[:10].replace('-', '')) if fecha_iso else None
                             except ValueError:
                                 date_key = None
-                            
+
                             if date_key is not None:
                                 valores_b.append((
                                     id_bitacora,
@@ -285,8 +348,8 @@ def ejecutar_sincronizacion():
                     if valores_b:
                         query_b = """
                             INSERT INTO fact_bitacora (
-                                id_bitacora, placa, fecha_actividad, date_key, 
-                                lugar_recorrido, actividad_desarrollada, 
+                                id_bitacora, placa, fecha_actividad, date_key,
+                                lugar_recorrido, actividad_desarrollada,
                                 id_conductor, id_responsable_1, id_responsable_2
                             )
                             VALUES %s
@@ -312,6 +375,7 @@ def ejecutar_sincronizacion():
     except Exception as e:
         console.print(f"\n[bold red]❌ ERROR CRÍTICO DE CONEXIÓN O EJECUCIÓN: {e}[/bold red]")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     ejecutar_sincronizacion()
